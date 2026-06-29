@@ -1,10 +1,5 @@
 package com.example.gps_tracker
 
-import io.flutter.embedding.android.FlutterActivity
-
-class MainActivity : FlutterActivity()
-package com.example.gps_tracker
-
 import android.content.Context
 import android.content.Intent
 import android.os.BatteryManager
@@ -15,6 +10,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity: FlutterActivity() {
+    
     private val BATTERY_CHANNEL = "com.example.gps_tracker/battery"
     private val CONTROL_CHANNEL = "com.example.gps_tracker/control"
 
