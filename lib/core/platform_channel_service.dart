@@ -49,4 +49,21 @@ class PlatformChannelService {
       }
     }
   }
+
+  /// Queries the Kotlin layer to determine if the Foreground Service is actively executing.
+  static Future<bool> isServiceRunning() async {
+    try {
+      final bool result = await _controlChannel.invokeMethod(
+        'isServiceRunning',
+      );
+      return result;
+    } on PlatformException catch (e) {
+      if (kDebugMode) {
+        print(
+          "SYSTEM METRIC: IPC Failure - Unable to verify service state: '${e.message}'.",
+        );
+      }
+      return false;
+    }
+  }
 }

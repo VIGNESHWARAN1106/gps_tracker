@@ -32,7 +32,7 @@ class MainActivity: FlutterActivity() {
         }
 
         // 2. Service Control Channel
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CONTROL_CHANNEL).setMethodCallHandler { call, result ->
+       MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CONTROL_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startTracking" -> {
                     executeServiceInitialization()
@@ -41,6 +41,10 @@ class MainActivity: FlutterActivity() {
                 "stopTracking" -> {
                     executeServiceTermination()
                     result.success(true)
+                }
+                "isServiceRunning" -> {
+                    // Returns the static flag from the service to the Flutter UI
+                    result.success(LocationService.isServiceRunning)
                 }
                 else -> {
                     result.notImplemented()

@@ -1,122 +1,376 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'core/platform_channel_service.dart';
+import 'core/database_repository.dart';
 
 void main() {
-  runApp(const MyApp());
+  runApp(const GPSTrackerApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class GPSTrackerApp extends StatelessWidget {
+  const GPSTrackerApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'GPS Tracker',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF00E676),
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const TrackingHomeScreen(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class TrackingHomeScreen extends StatefulWidget {
+  const TrackingHomeScreen({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<TrackingHomeScreen> createState() => _TrackingHomeScreenState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _TrackingHomeScreenState extends State<TrackingHomeScreen> {
+  int _batteryLevel = -1;
+  bool _isTrackingActive = false;
+  List<Map<String, dynamic>> _telemetryLog = [];
 
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
-    });
+  Timer? _batteryTimer;
+  Timer? _databaseRefreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _executePreFlightValidation();
+    _startPeriodicTelemetryPolling();
+  }
+
+  @override
+  void dispose() {
+    _batteryTimer?.cancel();
+    _databaseRefreshTimer?.cancel();
+    super.dispose();
+  }
+
+  /// Evaluates and enforces OS-level authorization requirements and hardware states.
+  Future<void> _executePreFlightValidation() async {
+    // 1. HARDWARE STATE CHECK: Verify the physical GPS radio is powered on
+    bool isLocationServiceEnabled =
+        await Permission.location.serviceStatus.isEnabled;
+    if (!isLocationServiceEnabled) {
+      _showSettingsDialog(
+        "System GPS is currently disabled. The tracker cannot acquire hardware telemetry. Please turn on Location services in your device settings.",
+      );
+      return; // Abort further permission checks until hardware is active
+    }
+
+    // 2. SOFTWARE AUTHORIZATION: Request primary foreground permissions
+    Map<Permission, PermissionStatus> statuses = await [
+      Permission.location,
+      Permission.notification,
+    ].request();
+
+    bool locationGranted = statuses[Permission.location]?.isGranted ?? false;
+    bool locationPermanentlyDenied =
+        statuses[Permission.location]?.isPermanentlyDenied ?? false;
+
+    // 3. Handle Permanent Denial (The OS blocked the prompt)
+    if (locationPermanentlyDenied) {
+      _showSettingsDialog(
+        "Location permission is permanently denied. The tracker lacks software authorization. Please enable it in system settings.",
+      );
+      return;
+    }
+
+    // 4. Handle Background Location Authorization
+    if (locationGranted) {
+      PermissionStatus bgStatus = await Permission.locationAlways.request();
+
+      if (bgStatus.isPermanentlyDenied) {
+        _showSettingsDialog(
+          "Background tracking authorization is required to operate while minimized. Please select 'Allow all the time' in system settings.",
+        );
+        return;
+      }
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              "SYSTEM WARNING: Tracking requires location permissions to operate.",
+            ),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+      return;
+    }
+
+    bool serviceStatus = await PlatformChannelService.isServiceRunning();
+    if (mounted) {
+      setState(() {
+        _isTrackingActive = serviceStatus;
+      });
+    }
+
+    // If execution reaches this block, both hardware and software gates are cleared.
+    _refreshHardwareMetrics();
+    _refreshLocalTelemetry();
+  }
+
+  /// Schedules UI polling loops to refresh presentation data.
+  void _startPeriodicTelemetryPolling() {
+    // Polls battery metrics periodically to fulfill core requirement [cite: 30]
+    _batteryTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _refreshHardwareMetrics(),
+    );
+
+    // Polls local SQLite file every 10 seconds to display active telemetry logs safely without blockages
+    _databaseRefreshTimer = Timer.periodic(
+      const Duration(seconds: 10),
+      (_) => _refreshLocalTelemetry(),
+    );
+  }
+
+  Future<void> _refreshHardwareMetrics() async {
+    final int level = await PlatformChannelService.getBatteryLevel();
+    if (mounted) {
+      setState(() {
+        _batteryLevel = level;
+      });
+    }
+  }
+
+  Future<void> _refreshLocalTelemetry() async {
+    final List<Map<String, dynamic>> data =
+        await DatabaseRepository.fetchTelemetryLog();
+    if (mounted) {
+      setState(() {
+        _telemetryLog = data;
+      });
+    }
+  }
+
+  /// Helper method to route the user to OS Settings when permissions are hard-locked.
+  void _showSettingsDialog(String message) {
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false, // Force user interaction
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text(
+            'Permission Required',
+            style: TextStyle(color: Colors.redAccent),
+          ),
+          content: Text(message),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+          actions: [
+            TextButton(
+              child: const Text('Cancel', style: TextStyle(color: Colors.grey)),
+              onPressed: () => Navigator.of(context).pop(),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.greenAccent,
+                foregroundColor: Colors.black,
+              ),
+              child: const Text('Open Settings'),
+              onPressed: () {
+                openAppSettings(); // Triggers the permission_handler native routing
+                Navigator.of(context).pop();
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _toggleTrackingSession() async {
+    if (_isTrackingActive) {
+      await PlatformChannelService.stopTrackingSession();
+      setState(() {
+        _isTrackingActive = false;
+      });
+    } else {
+      // Defensive Check: Halt execution if user revoked location permissions manually
+      if (await Permission.location.isGranted) {
+        await PlatformChannelService.startTrackingSession();
+        setState(() {
+          _isTrackingActive = true;
+        });
+      } else {
+        _executePreFlightValidation();
+      }
+    }
+    _refreshLocalTelemetry();
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('Telemetry Command Center'),
+        centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () {
+              _refreshHardwareMetrics();
+              _refreshLocalTelemetry();
+            },
+          ),
+        ],
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
         child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Battery Status Card Component [cite: 29]
+            Card(
+              elevation: 4,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Row(
+                  children: [
+                    Icon(
+                      _batteryLevel > 20
+                          ? Icons.battery_charging_full
+                          : Icons.battery_alert,
+                      size: 40,
+                      color: _batteryLevel > 20
+                          ? Colors.greenAccent
+                          : Colors.redAccent,
+                    ),
+                    const SizedBox(width: 16),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'System Battery Metrics',
+                          style: TextStyle(fontSize: 14, color: Colors.grey),
+                        ),
+                        Text(
+                          _batteryLevel != -1
+                              ? '$_batteryLevel%'
+                              : 'Computing...',
+                          style: const TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            // Operational Control Button Component [cite: 11, 12]
+            ElevatedButton(
+              onPressed: _toggleTrackingSession,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _isTrackingActive
+                    ? Colors.redAccent
+                    : Colors.greenAccent,
+                foregroundColor: Colors.black,
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(_isTrackingActive ? Icons.stop : Icons.play_arrow),
+                  const SizedBox(width: 8),
+                  Text(
+                    _isTrackingActive
+                        ? 'STOP TRACKING SESSION'
+                        : 'START TRACKING SESSION',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 24),
+
+            // Live Telemetry Ledger Section [cite: 27]
+            const Text(
+              'Recorded Locations Logs',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: Colors.greenAccent,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: _telemetryLog.isEmpty
+                  ? Center(
+                      child: Text(
+                        _isTrackingActive
+                            ? 'Awaiting first telemetry ping (60s interval)...'
+                            : 'No active session data found.',
+                        style: const TextStyle(color: Colors.grey),
+                        textAlign: TextAlign.center,
+                      ),
+                    )
+                  : ListView.builder(
+                      itemCount: _telemetryLog.length,
+                      itemBuilder: (context, index) {
+                        final log = _telemetryLog[index];
+                        final DateTime timestamp =
+                            DateTime.fromMillisecondsSinceEpoch(
+                              log['timestamp'],
+                            );
+
+                        return Card(
+                          margin: const EdgeInsets.symmetric(vertical: 6),
+                          child: ListTile(
+                            leading: CircleAvatar(
+                              backgroundColor: Colors.black12,
+                              child: Icon(
+                                Icons.location_on,
+                                color: Colors.greenAccent,
+                              ),
+                            ),
+                            title: Text(
+                              'Lat: ${log['latitude']}, Lon: ${log['longitude']}',
+                            ),
+                            subtitle: Text(
+                              'Time: ${timestamp.toIso8601String().substring(11, 19)} | Accuracy: ${log['accuracy']}m',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey,
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
   }
 }
