@@ -1,3 +1,4 @@
+import 'package:gps_tracker/data/models/tracker_record_model.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:flutter/foundation.dart';
@@ -37,10 +38,15 @@ class DatabaseRepository {
     );
   }
 
-  static Future<List<Map<String, dynamic>>> fetchTelemetryLog() async {
+  static Future<List<TrackerRecord>> fetchTelemetryLog() async {
     try {
       final db = await database;
-      return await db.query('locations', orderBy: 'timestamp DESC');
+      final List<Map<String, dynamic>> maps = await db.query(
+        'locations',
+        orderBy: 'timestamp DESC',
+      );
+
+      return maps.map((map) => TrackerRecord.fromMap(map)).toList();
     } catch (e) {
       if (kDebugMode) {
         print("SYSTEM METRIC: Disk Read Failure - $e");
